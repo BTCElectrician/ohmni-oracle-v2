@@ -8,8 +8,9 @@ from .document_processor import DocumentProcessor
 from openai import AsyncOpenAI
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import AnalyzeResult
+from azure.ai.documentintelligence.models import AnalyzeResult, AnalyzeDocumentRequest
 from pathlib import Path
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -35,25 +36,11 @@ DRAWING_INSTRUCTIONS = {
 
 class DrawingProcessor(DocumentProcessor):
     def __init__(self, endpoint: Optional[str] = None, key: Optional[str] = None):
-        self.endpoint = endpoint or os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
-        if not self.endpoint:
-            raise ValueError("Azure Document Intelligence endpoint not provided")
-            
-        key = key or os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
-        if not key:
-            raise ValueError("Azure Document Intelligence API key not provided")
-        
-        self.credential = AzureKeyCredential(key)
-        self.client = DocumentIntelligenceClient(
-            endpoint=self.endpoint, 
-            credential=self.credential
-        )
+        super().__init__(endpoint, key)
         self.openai_client = AsyncOpenAI()
 
     async def process_drawing(self, file_path: str) -> Dict[str, Any]:
-        """
-        Process a drawing file using Azure Document Intelligence or fallback to PyMuPDF.
-        """
+        """Process a drawing using Azure Document Intelligence."""
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Drawing file not found: {file_path}")
             
@@ -62,28 +49,93 @@ class DrawingProcessor(DocumentProcessor):
             return await self.process_large_drawing(file_path)
 
         try:
-            async with aiofiles.open(file_path, 'rb') as file:
-                content = await file.read()
-                
-            return await self._process_with_azure(content)
+            # Updated to use direct file handling
+            with open(file_path, "rb") as f:
+                return await self._process_with_azure(f)
         except Exception as e:
-            logger.error(f"Azure Document Intelligence failed for {file_path}: {e}")
+            logger.error(f"Azure Document Intelligence processing failed: {e}")
             return await self._fallback_to_pymupdf(file_path)
 
-    async def _process_with_azure(self, content: bytes) -> Dict[str, Any]:
-        """
-        Process document content using Azure Document Intelligence.
-        """
+    async def _process_with_azure(self, file_obj) -> Dict[str, Any]:
+        """Process document with Azure Document Intelligence."""
         try:
+            # Use the documented approach
             poller = await self.client.begin_analyze_document(
                 "prebuilt-layout",
-                document=content,
-                pages="1-",
-                features=["tables", "selectionMarks", "languages"]
+                analyze_request=file_obj,
+                content_type="application/octet-stream"
             )
-            return self._parse_drawing_content(await poller.result())
+            
+            result = await poller.result()
+
+            # Parse according to documented schema
+            parsed_data = {
+                "content": {},
+                "tables": [],
+                "text_blocks": [],
+                "metadata": {}
+            }
+
+            # Extract pages content
+            if hasattr(result, 'pages'):
+                parsed_data["content"]["pages"] = []
+                for page in result.pages:
+                    page_content = {
+                        "number": page.page_number if hasattr(page, 'page_number') else 0,
+                        "lines": [],
+                        "tables": []
+                    }
+                    if hasattr(page, 'lines'):
+                        for line in page.lines:
+                            page_content["lines"].append({
+                                "text": line.content if hasattr(line, 'content') else "",
+                                "spans": line.spans if hasattr(line, 'spans') else []
+                            })
+                    parsed_data["content"]["pages"].append(page_content)
+
+            # Extract paragraphs
+            if hasattr(result, 'paragraphs'):
+                parsed_data["text_blocks"] = [
+                    {
+                        "text": p.content if hasattr(p, 'content') else "",
+                        "role": p.role if hasattr(p, 'role') else None,
+                        "spans": p.spans if hasattr(p, 'spans') else []
+                    }
+                    for p in result.paragraphs
+                ]
+
+            # Extract tables
+            if hasattr(result, 'tables'):
+                for table in result.tables:
+                    table_data = {
+                        "row_count": table.row_count if hasattr(table, 'row_count') else 0,
+                        "column_count": table.column_count if hasattr(table, 'column_count') else 0,
+                        "cells": []
+                    }
+                    
+                    if hasattr(table, 'cells'):
+                        for cell in table.cells:
+                            cell_data = {
+                                "text": cell.content if hasattr(cell, 'content') else "",
+                                "row_index": cell.row_index if hasattr(cell, 'row_index') else 0,
+                                "column_index": cell.column_index if hasattr(cell, 'column_index') else 0,
+                                "row_span": cell.row_span if hasattr(cell, 'row_span') else 1,
+                                "column_span": cell.column_span if hasattr(cell, 'column_span') else 1
+                            }
+                            table_data["cells"].append(cell_data)
+                    
+                    parsed_data["tables"].append(table_data)
+
+            # Extract metadata
+            parsed_data["metadata"] = {
+                "languages": result.languages if hasattr(result, 'languages') else [],
+                "styles": result.styles if hasattr(result, 'styles') else []
+            }
+
+            return parsed_data
+
         except Exception as e:
-            logger.error(f"Azure Document Intelligence processing failed: {str(e)}")
+            logger.error(f"Azure processing failed: {str(e)}")
             raise
 
     def _parse_drawing_content(self, result: Any) -> Dict[str, Any]:
@@ -168,10 +220,8 @@ class DrawingProcessor(DocumentProcessor):
                 
         return results
 
-    async def analyze_document(self, raw_content: str, drawing_type: str, client: AsyncOpenAI):
-        """
-        Analyze document content using GPT for structured understanding.
-        """
+    async def analyze_document(self, raw_content: str, drawing_type: str, client: AsyncOpenAI) -> str:
+        """Analyze document content using GPT."""
         system_message = f"""
         Parse this {drawing_type} drawing/schedule into a structured JSON format. Guidelines:
         1. For text: Extract key information, categorize elements.
@@ -184,15 +234,25 @@ class DrawingProcessor(DocumentProcessor):
         """
         
         try:
+            # Ensure raw_content is a simple string
+            if not isinstance(raw_content, str):
+                raw_content = str(raw_content)
+
+            # Use the correct message format for OpenAI API 1.55.0
             response = await client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o-mini",  # Keeping your specified model
                 messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": raw_content}
+                    {
+                        "role": "system",
+                        "content": system_message
+                    },
+                    {
+                        "role": "user",
+                        "content": raw_content
+                    }
                 ],
                 temperature=0.2,
-                max_tokens=16000,
-                response_format={"type": "json_object"}
+                max_tokens=16000
             )
             return response.choices[0].message.content
         except Exception as e:

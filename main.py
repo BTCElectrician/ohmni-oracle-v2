@@ -64,6 +64,20 @@ def get_drawing_type(filename: Path) -> str:
     return 'General'
 
 async def async_safe_api_call(client: AsyncOpenAI, *args: Any, **kwargs: Any) -> Any:
+    """
+    Make an API call with retry logic and exponential backoff.
+    
+    Args:
+        client: AsyncOpenAI client instance
+        *args: Positional arguments for the API call
+        **kwargs: Keyword arguments for the API call
+        
+    Returns:
+        API response
+        
+    Raises:
+        Exception: If max retries are reached
+    """
     retries = 0
     delay = 1  # Initial delay for backoff
     while retries < MAX_RETRIES:
@@ -83,7 +97,19 @@ async def async_safe_api_call(client: AsyncOpenAI, *args: Any, **kwargs: Any) ->
     raise Exception("Failed to make API call after maximum retries")
 
 async def process_pdf_async(pdf_path: Path, client: AsyncOpenAI, output_folder: Path, 
-                          drawing_type: str, templates_created: Dict[str, bool]) -> Dict[str, Any]:
+                          drawing_type: str, templates_created: Dict[str, bool],
+                          processor: DrawingProcessor) -> Dict[str, Any]:
+    """
+    Process a single PDF file asynchronously.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        client: AsyncOpenAI client instance
+        output_folder: Output directory path
+        drawing_type: Type of drawing being processed
+        templates_created: Dictionary tracking created templates
+        processor: Shared DrawingProcessor instance for document processing
+    """
     file_name = pdf_path.name
     try:
         async with aiofiles.open(pdf_path, 'rb') as pdf_file:
@@ -91,11 +117,13 @@ async def process_pdf_async(pdf_path: Path, client: AsyncOpenAI, output_folder: 
                 try:
                     pbar.update(10)  # Start processing
                     
+                    # Get file content
+                    raw_content = None
+                    
                     # Try Azure Document Intelligence first
                     if is_panel_schedule_file(str(pdf_path)):
                         logging.info(f"Panel schedule detected, using Document Intelligence: {pdf_path}")
                         try:
-                            processor = DrawingProcessor()
                             raw_content = await processor.process_drawing(pdf_path)
                         except Exception as e:
                             logging.error(f"Document Intelligence failed for panel schedule: {str(e)}")
@@ -156,21 +184,28 @@ async def process_pdf_async(pdf_path: Path, client: AsyncOpenAI, output_folder: 
 
 async def process_batch_async(batch: List[Path], client: AsyncOpenAI, 
                             output_folder: Path, templates_created: Dict[str, bool]) -> List[Dict[str, Any]]:
+    """
+    Process a batch of PDF files asynchronously.
+    """
     tasks = []
     start_time = time.time()
-    semaphore = asyncio.Semaphore(5)  # New: limit concurrent operations
+    semaphore = asyncio.Semaphore(5)  # Limit concurrent operations
+    
+    # Initialize processor once for the batch
+    processor = DrawingProcessor()
     
     async def bounded_process(pdf_file: Path) -> Dict[str, Any]:
-        async with semaphore:  # New: ensure controlled concurrency
+        async with semaphore:
             drawing_type = get_drawing_type(pdf_file)
             return await process_pdf_async(
                 pdf_file, 
                 client, 
                 output_folder, 
                 drawing_type, 
-                templates_created
+                templates_created,
+                processor  # Pass the shared processor instance
             )
-    
+
     # Create tasks with bounded concurrency
     tasks = [bounded_process(pdf_file) for pdf_file in batch]
     
@@ -232,14 +267,25 @@ async def process_job_site_async(job_folder: Path, output_folder: Path) -> None:
             logging.warning(f" {failure['file']}: {failure['error']}")
 
 def verify_azure_credentials() -> bool:
-    """Verify that Azure credentials are properly configured."""
-    endpoint = os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
-    key = os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
+    """
+    Verify that Azure credentials are properly configured.
     
-    if not endpoint or not key:
-        logging.error("Azure credentials not found. Please check your .env file contains:")
-        logging.error("DOCUMENTINTELLIGENCE_ENDPOINT=your_azure_endpoint")
-        logging.error("DOCUMENTINTELLIGENCE_API_KEY=your_azure_key")
+    Returns:
+        bool: True if credentials are valid, False otherwise
+    """
+    required_vars = {
+        "DOCUMENTINTELLIGENCE_ENDPOINT": os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT"),
+        "DOCUMENTINTELLIGENCE_API_KEY": os.getenv("DOCUMENTINTELLIGENCE_API_KEY"),
+        "AZURE_OPENAI_ENDPOINT": os.getenv("AZURE_OPENAI_ENDPOINT"),
+        "AZURE_OPENAI_KEY": os.getenv("AZURE_OPENAI_KEY")
+    }
+    
+    missing_vars = [key for key, value in required_vars.items() if not value]
+    
+    if missing_vars:
+        logging.error("Missing required Azure credentials:")
+        for var in missing_vars:
+            logging.error(f"  {var} not found in environment variables")
         return False
     return True
 

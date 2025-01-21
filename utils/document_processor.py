@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # Azure imports
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import AnalyzeResult
+from azure.ai.documentintelligence.models import AnalyzeResult, AnalyzeDocumentRequest
 
 # Update these variable names
 DOCUMENTINTELLIGENCE_ENDPOINT = os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
@@ -33,18 +33,19 @@ def verify_azure_credentials() -> bool:
 
 class DocumentProcessor:
     def __init__(self, endpoint: Optional[str] = None, key: Optional[str] = None):
-        self.endpoint = endpoint or DOCUMENTINTELLIGENCE_ENDPOINT
+        self.endpoint = endpoint or os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
         if not self.endpoint:
-            raise ValueError("Azure Document Intelligence endpoint not provided")
+            raise ValueError("Document Intelligence endpoint not provided")
             
-        key = key or DOCUMENTINTELLIGENCE_KEY
+        key = key or os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
         if not key:
-            raise ValueError("Azure Document Intelligence API key not provided")
+            raise ValueError("Document Intelligence API key not provided")
         
         self.credential = AzureKeyCredential(key)
         self.client = DocumentIntelligenceClient(
             endpoint=self.endpoint, 
-            credential=self.credential
+            credential=self.credential,
+            api_version="2024-02-29-preview"  # Added API version specification
         )
 
     async def analyze_document(self, file_path: Path) -> AnalyzeResult:
