@@ -1,0 +1,12 @@
+{
+    "include": ["."],
+    "exclude": ["**/node_modules", "**/__pycache__"],
+    "ignore": [],
+    "defineConstant": {},
+    "venvPath": ".",
+    "venv": "venv",
+    "reportMissingImports": false,
+    "reportMissingModuleSource": false,
+    "pythonVersion": "3.11",
+    "pythonPlatform": "Darwin"
+}

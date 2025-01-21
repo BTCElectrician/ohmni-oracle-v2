@@ -1,0 +1,236 @@
+from typing import List, Dict, Any, Optional
+import asyncio
+import aiofiles
+import os
+import logging
+from tqdm.asyncio import tqdm_asyncio
+from .document_processor import DocumentProcessor
+from openai import AsyncOpenAI
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+DRAWING_INSTRUCTIONS = {
+    "Electrical": "Focus on panel schedules, circuit info, equipment schedules with electrical characteristics, and installation notes.",
+    "Mechanical": "Capture equipment schedules, HVAC details (CFM, capacities), and installation instructions.",
+    "Plumbing": "Include fixture schedules, pump details, water heater specs, pipe sizing, and system instructions.",
+    "Architectural": """
+    Extract and structure the following information:
+    1. Room details: Create a 'rooms' array with objects for each room, including:
+       - 'number': Room number (as a string)
+       - 'name': Room name
+       - 'finish': Ceiling finish
+       - 'height': Ceiling height
+    2. Room finish schedules
+    3. Door/window details
+    4. Wall types
+    5. Architectural notes
+    Ensure all rooms are captured and properly structured in the JSON output.
+    """,
+    "General": "Organize all relevant data into logical categories based on content type."
+}
+
+class DrawingProcessor(DocumentProcessor):
+    def __init__(self, endpoint: Optional[str] = None, key: Optional[str] = None):
+        self.endpoint = endpoint or os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
+        if not self.endpoint:
+            raise ValueError("Azure Document Intelligence endpoint not provided")
+            
+        key = key or os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
+        if not key:
+            raise ValueError("Azure Document Intelligence API key not provided")
+        
+        self.credential = AzureKeyCredential(key)
+        self.client = DocumentIntelligenceClient(
+            endpoint=self.endpoint, 
+            credential=self.credential
+        )
+        self.openai_client = AsyncOpenAI()
+
+    async def process_drawing(self, file_path: str) -> Dict[str, Any]:
+        """
+        Process a drawing file using Azure Document Intelligence or fallback to PyMuPDF.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Drawing file not found: {file_path}")
+            
+        file_size = os.path.getsize(file_path)
+        if file_size > 50_000_000:  # 50MB limit
+            return await self.process_large_drawing(file_path)
+
+        try:
+            async with aiofiles.open(file_path, 'rb') as file:
+                content = await file.read()
+                
+            return await self._process_with_azure(content)
+        except Exception as e:
+            logger.error(f"Azure Document Intelligence failed for {file_path}: {e}")
+            return await self._fallback_to_pymupdf(file_path)
+
+    async def _process_with_azure(self, content: bytes) -> Dict[str, Any]:
+        """
+        Process document content using Azure Document Intelligence.
+        """
+        try:
+            poller = await self.client.begin_analyze_document(
+                "prebuilt-layout",
+                document=content,
+                pages="1-",
+                features=["tables", "selectionMarks", "languages"]
+            )
+            return self._parse_drawing_content(await poller.result())
+        except Exception as e:
+            logger.error(f"Azure Document Intelligence processing failed: {str(e)}")
+            raise
+
+    def _parse_drawing_content(self, result: Any) -> Dict[str, Any]:
+        """
+        Parse the content returned from Azure Document Intelligence.
+        """
+        parsed_data = {
+            "tables": [],
+            "annotations": [],
+            "text_blocks": [],
+            "metadata": {
+                "page_count": result.page_count,
+                "languages": result.languages
+            }
+        }
+        
+        for table in result.tables:
+            processed_table = self._process_table(table)
+            if self._is_panel_schedule(processed_table):
+                processed_table["type"] = "panel_schedule"
+            parsed_data["tables"].append(processed_table)
+            
+        for paragraph in result.paragraphs:
+            parsed_data["text_blocks"].append({
+                "content": paragraph.content,
+                "coordinates": paragraph.bounding_regions[0].polygon if paragraph.bounding_regions else None,
+                "role": paragraph.role
+            })
+            
+        return parsed_data
+
+    def _process_table(self, table: Any) -> Dict[str, Any]:
+        """
+        Process a table from Azure Document Intelligence result.
+        """
+        processed_table = {
+            "rows": len(table.rows),
+            "columns": len(table.columns),
+            "cells": []
+        }
+        
+        for cell in table.cells:
+            processed_table["cells"].append({
+                "text": cell.content,
+                "row_index": cell.row_index,
+                "column_index": cell.column_index,
+                "row_span": cell.row_span,
+                "column_span": cell.column_span
+            })
+        
+        return processed_table
+
+    def _is_panel_schedule(self, table: Dict[str, Any]) -> bool:
+        """
+        Determine if a table is an electrical panel schedule.
+        """
+        panel_keywords = ["circuit", "breaker", "load", "amps", "poles", "phase"]
+        first_row_text = " ".join(
+            cell["text"].lower() 
+            for cell in table["cells"] 
+            if cell["row_index"] == 0
+        )
+        return any(keyword in first_row_text for keyword in panel_keywords)
+
+    async def process_batch(self, file_paths: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Process multiple drawings in batch.
+        """
+        tasks = [self.process_drawing(path) for path in file_paths]
+        results = {}
+        
+        async for task, path in tqdm_asyncio.as_completed(
+            tasks, 
+            total=len(tasks),
+            desc="Processing drawings"
+        ):
+            try:
+                results[path] = await task
+            except Exception as e:
+                logger.error(f"Failed to process {path}: {e}")
+                results[path] = {"error": str(e)}
+                
+        return results
+
+    async def analyze_document(self, raw_content: str, drawing_type: str, client: AsyncOpenAI):
+        """
+        Analyze document content using GPT for structured understanding.
+        """
+        system_message = f"""
+        Parse this {drawing_type} drawing/schedule into a structured JSON format. Guidelines:
+        1. For text: Extract key information, categorize elements.
+        2. For tables: Preserve structure, use nested arrays/objects.
+        3. Create a hierarchical structure, use consistent key names.
+        4. Include metadata (drawing number, scale, date) if available.
+        5. {DRAWING_INSTRUCTIONS.get(drawing_type, DRAWING_INSTRUCTIONS["General"])}
+        6. For all drawing types, if room information is present, always include a 'rooms' array in the JSON output, with each room having at least 'number' and 'name' fields.
+        Ensure the entire response is a valid JSON object.
+        """
+        
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": raw_content}
+                ],
+                temperature=0.2,
+                max_tokens=16000,
+                response_format={"type": "json_object"}
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error processing {drawing_type} drawing with GPT: {str(e)}")
+            raise
+
+    async def analyze_document_from_url(self, document_url: str, drawing_type: str) -> Dict[str, Any]:
+        """
+        Analyze a document from a URL using Azure Document Intelligence.
+        """
+        try:
+            poller = await self.client.begin_analyze_document_from_url(
+                "prebuilt-document",
+                document_url=document_url
+            )
+            result = await poller.result()
+            return result.to_dict()
+            
+        except Exception as e:
+            logger.error(f"Document Intelligence analysis from URL failed: {str(e)}")
+            raise
+
+    async def _fallback_to_pymupdf(self, file_path: str) -> Dict[str, Any]:
+        """
+        Fallback method when Azure Document Intelligence fails.
+        Uses PyMuPDF for basic text and table extraction.
+        """
+        from .pdf_processor import extract_text_and_tables_from_pdf
+        try:
+            raw_content = await extract_text_and_tables_from_pdf(file_path)
+            return {
+                "text_blocks": [{"content": raw_content}],
+                "tables": [],
+                "metadata": {
+                    "processed_by": "PyMuPDF fallback",
+                    "file_path": file_path
+                }
+            }
+        except Exception as e:
+            logger.error(f"PyMuPDF fallback processing failed for {file_path}: {str(e)}")
+            raise
