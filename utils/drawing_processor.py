@@ -11,6 +11,7 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeResult, AnalyzeDocumentRequest
 from pathlib import Path
 import json
+from .common_utils import is_panel_schedule_file
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +45,37 @@ class DrawingProcessor(DocumentProcessor):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Drawing file not found: {file_path}")
             
+        # Get the base directory of the input file
+        base_dir = Path(file_path).parent.parent
+        output_dir = base_dir / "output"
+        output_dir.mkdir(exist_ok=True)
+        
         file_size = os.path.getsize(file_path)
         if file_size > 50_000_000:  # 50MB limit
             return await self.process_large_drawing(file_path)
 
         try:
-            # Updated to use direct file handling
-            with open(file_path, "rb") as f:
-                return await self._process_with_azure(f)
+            # First check if it's a panel schedule
+            if is_panel_schedule_file(str(file_path)):
+                logger.info("Panel schedule detected, using Document Intelligence")
+                async with aiofiles.open(file_path, "rb") as f:
+                    file_content = await f.read()
+                    return await self._process_with_azure(file_content)
+            else:
+                # For non-panel schedule drawings, use PyMuPDF directly
+                logger.info("Non-panel schedule drawing, using PyMuPDF")
+                return await self._fallback_to_pymupdf(file_path)
         except Exception as e:
-            logger.error(f"Azure Document Intelligence processing failed: {e}")
-            return await self._fallback_to_pymupdf(file_path)
+            logger.error(f"Processing failed: {e}")
+            raise
 
     async def _process_with_azure(self, file_obj) -> Dict[str, Any]:
         """Process document with Azure Document Intelligence."""
         try:
-            # Use the documented approach
+            # Create the analyze request with the correct parameters
             poller = await self.client.begin_analyze_document(
                 "prebuilt-layout",
-                analyze_request=file_obj,
+                body={"analyze_request": file_obj},  # Add body parameter
                 content_type="application/octet-stream"
             )
             
@@ -266,7 +279,7 @@ class DrawingProcessor(DocumentProcessor):
         try:
             poller = await self.client.begin_analyze_document_from_url(
                 "prebuilt-document",
-                document_url=document_url
+                analyze_request=document_url  # Updated parameter name
             )
             result = await poller.result()
             return result.to_dict()
@@ -282,8 +295,11 @@ class DrawingProcessor(DocumentProcessor):
         """
         from .pdf_processor import extract_text_and_tables_from_pdf
         try:
+            logger.info(f"Starting PyMuPDF extraction for: {file_path}")
             raw_content = await extract_text_and_tables_from_pdf(file_path)
-            return {
+            logger.info(f"PyMuPDF extraction completed. Content length: {len(str(raw_content))}")
+            
+            result = {
                 "text_blocks": [{"content": raw_content}],
                 "tables": [],
                 "metadata": {
@@ -291,6 +307,9 @@ class DrawingProcessor(DocumentProcessor):
                     "file_path": file_path
                 }
             }
+            logger.info("PyMuPDF result structure created successfully")
+            return result
+            
         except Exception as e:
             logger.error(f"PyMuPDF fallback processing failed for {file_path}: {str(e)}")
             raise

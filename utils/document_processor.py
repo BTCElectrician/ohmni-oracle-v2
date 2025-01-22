@@ -71,10 +71,11 @@ class DocumentProcessor:
                 if not document_content:
                     raise ValueError(f"Empty file: {file_path}")
                 
-                # Start the analysis
+                # Correct parameters for SDK v4.0
                 poller = await self.client.begin_analyze_document(
-                    "prebuilt-document",
-                    document_content
+                    "prebuilt-layout",
+                    analyze_request=document_content,  # This is the correct parameter name
+                    content_type="application/octet-stream"
                 )
                 
                 # Get the result

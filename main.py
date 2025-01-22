@@ -14,6 +14,7 @@ from typing import Dict, List, Any
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 import aiofiles
+from dotenv import load_dotenv
 
 # Local application imports
 from templates.room_templates import process_architectural_drawing
@@ -110,77 +111,67 @@ async def process_pdf_async(pdf_path: Path, client: AsyncOpenAI, output_folder: 
         templates_created: Dictionary tracking created templates
         processor: Shared DrawingProcessor instance for document processing
     """
-    file_name = pdf_path.name
-    try:
-        async with aiofiles.open(pdf_path, 'rb') as pdf_file:
-            with tqdm(total=100, desc=f"Processing {file_name}", leave=False) as pbar:
+    with tqdm(total=100, desc=f"Processing {pdf_path.name}") as pbar:
+        try:
+            # Create subdirectory for the drawing type
+            type_folder = output_folder / drawing_type
+            type_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Get file content
+            raw_content = None
+            
+            # Try Azure Document Intelligence first
+            if is_panel_schedule_file(str(pdf_path)):
+                logging.info(f"Panel schedule detected, using Document Intelligence: {pdf_path}")
                 try:
-                    pbar.update(10)  # Start processing
-                    
-                    # Get file content
-                    raw_content = None
-                    
-                    # Try Azure Document Intelligence first
-                    if is_panel_schedule_file(str(pdf_path)):
-                        logging.info(f"Panel schedule detected, using Document Intelligence: {pdf_path}")
-                        try:
-                            raw_content = await processor.process_drawing(pdf_path)
-                        except Exception as e:
-                            logging.error(f"Document Intelligence failed for panel schedule: {str(e)}")
-                            raw_content = await extract_text_and_tables_from_pdf(pdf_path)
-                    else:
-                        logging.info(f"Using PyMuPDF for standard processing: {pdf_path}")
-                        raw_content = await extract_text_and_tables_from_pdf(pdf_path)
-                    
-                    pbar.update(20)  # Text and tables extracted
-                    structured_json = await processor.analyze_document(raw_content, drawing_type, client)
-                    pbar.update(40)  # API call completed
-                    
-                    type_folder = output_folder / drawing_type
-                    type_folder.mkdir(parents=True, exist_ok=True)
-                    
-                    try:
-                        parsed_json = json.loads(structured_json)
-                        output_filename = f"{pdf_path.stem}_structured.json"
-                        output_path = type_folder / output_filename
-                        
-                        async with aiofiles.open(output_path, 'w') as f:
-                            await f.write(json.dumps(parsed_json, indent=2))
-                        
-                        pbar.update(20)  # JSON saved
-                        logging.info(f"Successfully processed and saved: {output_path}")
-                        
-                        if drawing_type == 'Architectural':
-                            result = process_architectural_drawing(parsed_json, str(pdf_path), str(type_folder))
-                            templates_created['floor_plan'] = True
-                            logging.info(f"Created room templates: {result}")
-                        
-                        pbar.update(10)  # Processing completed
-                        return {"success": True, "file": str(output_path)}
-                        
-                    except json.JSONDecodeError as e:
-                        pbar.update(100)  # Ensure bar completes on error
-                        logging.error(f"JSON parsing error for {pdf_path}: {str(e)}")
-                        logging.info(f"Raw API response: {structured_json}")
-                        raw_output_filename = f"{pdf_path.stem}_raw_response.json"
-                        raw_output_path = type_folder / raw_output_filename
-                        
-                        async with aiofiles.open(raw_output_path, 'w') as f:
-                            await f.write(structured_json)
-                            
-                        logging.warning(f"Saved raw API response to {raw_output_path}")
-                        return {"success": False, "error": "Failed to parse JSON", "file": str(pdf_path)}
-                        
+                    raw_content = await processor.process_drawing(pdf_path)
                 except Exception as e:
-                    pbar.update(100)  # Ensure bar completes on error
-                    logging.error(f"Error processing {pdf_path}: {str(e)}")
-                    return {"success": False, "error": str(e), "file": str(pdf_path)}
-    except FileNotFoundError:
-        logging.error(f"File not found: {pdf_path}")
-        return {"success": False, "error": "File not found", "file": str(pdf_path)}
-    except Exception as e:
-        logging.error(f"Error opening file {pdf_path}: {str(e)}")
-        return {"success": False, "error": f"File access error: {str(e)}", "file": str(pdf_path)}
+                    logging.error(f"Document Intelligence failed for panel schedule: {str(e)}")
+                    raw_content = await extract_text_and_tables_from_pdf(pdf_path)
+            else:
+                logging.info(f"Using PyMuPDF for standard processing: {pdf_path}")
+                raw_content = await extract_text_and_tables_from_pdf(pdf_path)
+            
+            pbar.update(20)  # Text and tables extracted
+            structured_json = await processor.analyze_document(raw_content, drawing_type, client)
+            pbar.update(40)  # API call completed
+            
+            try:
+                parsed_json = json.loads(structured_json)
+                output_filename = f"{pdf_path.stem}_structured.json"
+                output_path = type_folder / output_filename
+                
+                async with aiofiles.open(output_path, 'w') as f:
+                    await f.write(json.dumps(parsed_json, indent=2))
+                
+                pbar.update(20)  # JSON saved
+                logging.info(f"Successfully processed and saved: {output_path}")
+                
+                if drawing_type == 'Architectural':
+                    result = process_architectural_drawing(parsed_json, str(pdf_path), str(type_folder))
+                    templates_created['floor_plan'] = True
+                    logging.info(f"Created room templates: {result}")
+                
+                pbar.update(10)  # Processing completed
+                return {"success": True, "file": str(output_path)}
+                
+            except json.JSONDecodeError as e:
+                pbar.update(100)  # Ensure bar completes on error
+                logging.error(f"JSON parsing error for {pdf_path}: {str(e)}")
+                logging.info(f"Raw API response: {structured_json}")
+                raw_output_filename = f"{pdf_path.stem}_raw_response.json"
+                raw_output_path = type_folder / raw_output_filename
+                
+                async with aiofiles.open(raw_output_path, 'w') as f:
+                    await f.write(structured_json)
+                    
+                logging.warning(f"Saved raw API response to {raw_output_path}")
+                return {"success": False, "error": "Failed to parse JSON", "file": str(pdf_path)}
+                
+        except Exception as e:
+            pbar.update(100)  # Ensure bar completes on error
+            logging.error(f"Error processing {pdf_path}: {str(e)}")
+            return {"success": False, "error": str(e), "file": str(pdf_path)}
 
 async def process_batch_async(batch: List[Path], client: AsyncOpenAI, 
                             output_folder: Path, templates_created: Dict[str, bool]) -> List[Dict[str, Any]]:
@@ -308,5 +299,7 @@ if __name__ == "__main__":
         
     logging.info(f"Processing files from: {job_folder}")
     logging.info(f"Output will be saved to: {output_folder}")
+    
+    load_dotenv()
     
     asyncio.run(process_job_site_async(job_folder, output_folder))
